@@ -267,6 +267,145 @@ public class PDFMarkedContentGateTest extends TikaTest {
         }
     }
 
+    /**
+     * Text drawn as images (Word rasterizes text with effects) is in the element's /ActualText
+     * only: that is the element's text, once, where its content is. Word writes the spaces
+     * between such Spans as Spans with /ActualText and no content.
+     */
+    @Test
+    public void testElementActualTextStandsInForImages() throws Exception {
+        try (TaggedPdfBuilder b = new TaggedPdfBuilder()) {
+            PDPage one = b.page();
+            PDPage two = b.page();
+            PDImageXObject image = LosslessFactory.createFromImage(b.doc,
+                    new BufferedImage(2, 2, BufferedImage.TYPE_INT_RGB));
+            PDStructureElement title = b.element("P", b.document, one);
+            PDStructureElement first = b.leaf("Span", title, one, 0);
+            first.setActualText("INFORMATION SECURITY");
+            // the element's content runs on to the next page: still written once
+            reference(first, null, two, 0);
+            b.element("Span", title, one).setActualText(" ");
+            PDStructureElement second = b.leaf("Span", title, one, 1);
+            second.appendKid(5);
+            second.setActualText("POLICY");
+            PDStructureElement p = b.element("P", b.document, one);
+            b.leaf("Span", p, one, 2);
+            b.leaf("Span", p, one, 3).setActualText("as an image");
+            b.leaf("Span", p, one, 4);
+            PDPageContentStream cs = new PDPageContentStream(b.doc, one);
+            for (int mcid = 0; mcid < 2; mcid++) {
+                cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(mcid));
+                cs.drawImage(image, 72 + mcid * 10, 700, 2, 2);
+                cs.endMarkedContent();
+            }
+            imageSpanBetweenWords(cs, b, 2, "Drawn", 3, image, 4, "here");
+            cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(5));
+            cs.drawImage(image, 92, 700, 2, 2);
+            cs.endMarkedContent();
+            cs.close();
+            cs = new PDPageContentStream(b.doc, two);
+            cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(0));
+            cs.drawImage(image, 72, 700, 2, 2);
+            cs.endMarkedContent();
+            cs.close();
+
+            Result auto = parse(b.bytes(), config(MarkedContentConfig.Strategy.AUTO));
+            assertContains("<p>INFORMATION SECURITY POLICY</p>\n<p>Drawn as an image here</p>",
+                    auto.page(1));
+            assertContainsCount("INFORMATION SECURITY", auto.body(), 1);
+            assertContainsCount("POLICY", auto.body(), 1);
+            assertEquals(1, auto.metadata.getInt(PDF.MARKED_CONTENT_PAGES_TAGGED));
+            assertWellFormed(auto.xml);
+        }
+    }
+
+    /**
+     * Word also separates such Spans with Spans that draw only a space glyph, all at one spot:
+     * each is a word boundary, though the stripper keeps only the first of the overlapping glyphs.
+     */
+    @Test
+    public void testSpaceGlyphSpansSeparateActualText() throws Exception {
+        try (TaggedPdfBuilder b = new TaggedPdfBuilder()) {
+            PDPage page = b.page();
+            PDImageXObject image = LosslessFactory.createFromImage(b.doc,
+                    new BufferedImage(2, 2, BufferedImage.TYPE_INT_RGB));
+            PDStructureElement p = b.element("P", b.document, page);
+            String[] words = {"policies,", "frameworks", "and controls"};
+            for (int i = 0; i < words.length; i++) {
+                b.leaf("Span", p, page, 2 * i).setActualText(words[i]);
+                if (i < words.length - 1) {
+                    b.leaf("Span", p, page, 2 * i + 1);
+                }
+            }
+            PDPageContentStream cs = new PDPageContentStream(b.doc, page);
+            for (int mcid = 0; mcid < 2 * words.length - 1; mcid++) {
+                cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(mcid));
+                if (mcid % 2 == 0) {
+                    cs.drawImage(image, 72 + mcid * 40, 700, 2, 2);
+                } else {
+                    cs.beginText();
+                    cs.setFont(b.font, 12);
+                    cs.newLineAtOffset(300, 500);
+                    cs.showText(" ");
+                    cs.endText();
+                }
+                cs.endMarkedContent();
+            }
+            cs.close();
+
+            for (boolean suppress : new boolean[]{true, false}) {
+                PDFParserConfig config = config(MarkedContentConfig.Strategy.AUTO);
+                config.setSuppressDuplicateOverlappingText(suppress);
+                Result auto = parse(b.bytes(), config);
+                assertContains("<p>policies, frameworks and controls</p>", auto.page(1));
+            }
+        }
+    }
+
+    /** Where the element's content draws text, that text is written, and /ActualText is not. */
+    @Test
+    public void testElementActualTextOverGlyphsIsNotRepeated() throws Exception {
+        try (TaggedPdfBuilder b = new TaggedPdfBuilder()) {
+            PDPage page = b.page();
+            PDStructureElement p = b.element("P", b.document, page);
+            b.leaf("Span", p, page, 0).setActualText("Glyph text");
+            b.leaf("Span", p, page, 1).setActualText("Replacement");
+            PDPageContentStream cs = b.text(page);
+            taggedLine(cs, COSName.getPDFName("Span"), 0, "Glyph text");
+            taggedLine(cs, COSName.getPDFName("Span"), 1, "Drawn words");
+            finish(cs);
+
+            Result auto = parse(b.bytes(), config(MarkedContentConfig.Strategy.AUTO));
+            assertContains("<p>Glyph text\nDrawn words</p>", auto.body());
+            assertContainsCount("Glyph text", auto.body(), 1);
+            assertNotContained("Replacement", auto.body());
+        }
+    }
+
+    /** Glyphs under one MCID, an image under another, then glyphs under a third, on one line. */
+    private static void imageSpanBetweenWords(PDPageContentStream cs, TaggedPdfBuilder b,
+                                              int before, String beforeText, int image,
+                                              PDImageXObject imageObject, int after,
+                                              String afterText) throws IOException {
+        cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(before));
+        cs.beginText();
+        cs.setFont(b.font, 12);
+        cs.newLineAtOffset(72, 600);
+        cs.showText(beforeText);
+        cs.endText();
+        cs.endMarkedContent();
+        cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(image));
+        cs.drawImage(imageObject, 120, 600, 60, 12);
+        cs.endMarkedContent();
+        cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(after));
+        cs.beginText();
+        cs.setFont(b.font, 12);
+        cs.newLineAtOffset(190, 600);
+        cs.showText(afterText);
+        cs.endText();
+        cs.endMarkedContent();
+    }
+
     @Test
     public void testWordDrawnAcrossCellsIsSplit() throws Exception {
         try (TaggedPdfBuilder b = new TaggedPdfBuilder()) {

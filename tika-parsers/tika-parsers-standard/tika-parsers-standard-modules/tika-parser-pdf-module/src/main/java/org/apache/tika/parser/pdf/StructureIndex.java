@@ -120,6 +120,8 @@ final class StructureIndex {
     }
 
     private final Map<COSBase, Map<Integer, Leaf>> leavesByScope = new IdentityHashMap<>();
+    /** Elements with /ActualText and no content, by id: text that sits between siblings. */
+    private final Map<Integer, Node> contentlessActualText = new HashMap<>();
     /** Figures and formulas that reference an object rather than text, by page. */
     private final Map<COSBase, List<Leaf>> objectLeavesByPage = new IdentityHashMap<>();
     private final Map<String, Object> roleMap;
@@ -182,6 +184,21 @@ final class StructureIndex {
         return m == null ? null : m.get(mcid);
     }
 
+    /**
+     * The /ActualText of the elements without content that directly follow the given one among
+     * its siblings, such as the spaces Word writes as Spans between Spans; empty if none.
+     * Element ids are in preorder, so an element without child elements is followed by its next
+     * sibling.
+     */
+    String actualTextAfter(Node node) {
+        StringBuilder sb = new StringBuilder();
+        for (Node n = contentlessActualText.get(node.id + 1); n != null && n.parent == node.parent;
+                n = contentlessActualText.get(n.id + 1)) {
+            sb.append(n.dict.getString(COSName.ACTUAL_TEXT));
+        }
+        return sb.toString();
+    }
+
     /** Figure and formula elements on the page whose content is an object, in document order. */
     List<Leaf> objectLeaves(COSBase page) {
         List<Leaf> l = objectLeavesByPage.get(page);
@@ -234,6 +251,10 @@ final class StructureIndex {
                     COSBase k = dict.getItem(COSName.K);
                     if (k != null) {
                         pushKids(k, node, f.depth + 1, page, stack);
+                    }
+                    if ((k == null || k instanceof COSArray && ((COSArray) k).size() == 0)
+                            && dict.getString(COSName.ACTUAL_TEXT) != null) {
+                        contentlessActualText.put(node.id, node);
                     }
                 } else if (COSName.MCR.getName().equals(type)) {
                     if (f.parent == null) {
@@ -299,6 +320,7 @@ final class StructureIndex {
         reason = why;
         leavesByScope.clear();
         objectLeavesByPage.clear();
+        contentlessActualText.clear();
     }
 
     /** Types whose content is an image or drawing, described by /Alt rather than by text. */
