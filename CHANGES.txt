@@ -134,6 +134,10 @@ Release 4.2.0 - 10/22/2026
 
   EXTRACTION AND FORMATS
 
+   * PDF: in tagged PDFs, a structure element's /ActualText is written as its text when
+     its content draws no glyphs, as in Word exports that draw text with effects as
+     images; elements whose content draws text are unchanged (TIKA-XXXX).
+
    * docx: OMML equations are wrapped in <span class="omml"> (TIKA-4968); REF, PAGEREF,
      NOTEREF, HYPERLINK \l and simple fields link to their bookmarks (TIKA-4967);
      bold and italics from character styles are applied, with opt-in
