@@ -319,6 +319,49 @@ public class PDFMarkedContentGateTest extends TikaTest {
         }
     }
 
+    /**
+     * Word also separates such Spans with Spans that draw only a space glyph, all at one spot:
+     * each is a word boundary, though the stripper keeps only the first of the overlapping glyphs.
+     */
+    @Test
+    public void testSpaceGlyphSpansSeparateActualText() throws Exception {
+        try (TaggedPdfBuilder b = new TaggedPdfBuilder()) {
+            PDPage page = b.page();
+            PDImageXObject image = LosslessFactory.createFromImage(b.doc,
+                    new BufferedImage(2, 2, BufferedImage.TYPE_INT_RGB));
+            PDStructureElement p = b.element("P", b.document, page);
+            String[] words = {"policies,", "frameworks", "and controls"};
+            for (int i = 0; i < words.length; i++) {
+                b.leaf("Span", p, page, 2 * i).setActualText(words[i]);
+                if (i < words.length - 1) {
+                    b.leaf("Span", p, page, 2 * i + 1);
+                }
+            }
+            PDPageContentStream cs = new PDPageContentStream(b.doc, page);
+            for (int mcid = 0; mcid < 2 * words.length - 1; mcid++) {
+                cs.beginMarkedContent(COSName.getPDFName("Span"), mcid(mcid));
+                if (mcid % 2 == 0) {
+                    cs.drawImage(image, 72 + mcid * 40, 700, 2, 2);
+                } else {
+                    cs.beginText();
+                    cs.setFont(b.font, 12);
+                    cs.newLineAtOffset(300, 500);
+                    cs.showText(" ");
+                    cs.endText();
+                }
+                cs.endMarkedContent();
+            }
+            cs.close();
+
+            for (boolean suppress : new boolean[]{true, false}) {
+                PDFParserConfig config = config(MarkedContentConfig.Strategy.AUTO);
+                config.setSuppressDuplicateOverlappingText(suppress);
+                Result auto = parse(b.bytes(), config);
+                assertContains("<p>policies, frameworks and controls</p>", auto.page(1));
+            }
+        }
+    }
+
     /** Where the element's content draws text, that text is written, and /ActualText is not. */
     @Test
     public void testElementActualTextOverGlyphsIsNotRepeated() throws Exception {

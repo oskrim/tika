@@ -24,6 +24,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -334,6 +335,8 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
     private final Map<Label, Integer> openedMcids = new LinkedHashMap<>();
     /** Element /ActualText still to be written while routing, by the MCID it starts at. */
     private final Map<Label, String> pendingActualText = new LinkedHashMap<>();
+    /** Pending /ActualText followed by content that draws only spaces: a word boundary. */
+    private final Set<Label> spaceAfterActualText = new HashSet<>();
     /** Elements whose /ActualText was taken, so it is written once per document. */
     private final Set<StructureIndex.Node> actualTextTaken =
             Collections.newSetFromMap(new IdentityHashMap<>());
@@ -551,6 +554,7 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
         glyphOrder.clear();
         openedMcids.clear();
         pendingActualText.clear();
+        spaceAfterActualText.clear();
         events.clear();
         currentLabel = null;
         pendingPageStart = false;
@@ -585,6 +589,7 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
             labels.clear();
             glyphOrder.clear();
             pendingActualText.clear();
+            spaceAfterActualText.clear();
         }
         PageStats stats = stats();
         String rejection = gate(stats);
@@ -657,6 +662,15 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
             return;
         }
         int n = textPositions == null ? 0 : textPositions.size();
+        if (n > 1 && text.isBlank() && !pendingActualText.isEmpty()) {
+            // spaces drawn at one spot can come from MCIDs with /ActualText opened between
+            // them, so each space is routed on its own
+            for (TextPosition position : textPositions) {
+                String u = position.getUnicode();
+                writeString(u == null ? "" : u, List.of(position));
+            }
+            return;
+        }
         Integer order = n == 0 ? null : glyphOrder.get(textPositions.get(0));
         if (order != null) {
             routeActualText(order, text);
@@ -710,16 +724,22 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
      */
     private void collectActualText() {
         Set<StructureIndex.Node> drewText = Collections.newSetFromMap(new IdentityHashMap<>());
+        Set<Label> inked = new HashSet<>();
+        Set<Label> spaces = new HashSet<>();
         for (Map.Entry<TextPosition, Label> e : labels.entrySet()) {
             String u = e.getKey().getUnicode();
             Label l = e.getValue();
-            StructureIndex.Leaf leaf = u == null || u.isBlank() || !l.tagged() ? null :
+            boolean blank = u == null || u.isBlank();
+            (blank ? spaces : inked).add(l);
+            StructureIndex.Leaf leaf = blank || !l.tagged() ? null :
                     index.leaf(l.scope, l.mcid);
             StructureIndex.Node n = leaf == null ? null : leaf.node;
             while (n != null && drewText.add(n)) {
                 n = n.parent;
             }
         }
+        spaces.removeAll(inked);
+        Label last = null;
         for (Label label : openedMcids.keySet()) {
             StructureIndex.Leaf leaf = index.leaf(label.scope, label.mcid);
             StructureIndex.Node element = null;
@@ -734,6 +754,14 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
             }
             if (element != null && actualTextTaken.add(element)) {
                 pendingActualText.put(label, text + index.actualTextAfter(element));
+                last = label;
+            } else if (inked.contains(label)) {
+                last = null;
+            } else if (last != null && spaces.contains(label)) {
+                // content that draws only spaces is a word boundary, even where the stripper
+                // drops its glyph as a duplicate of an earlier one at the same spot
+                spaceAfterActualText.add(last);
+                last = null;
             }
         }
     }
@@ -752,16 +780,26 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
             if (openedMcids.get(e.getKey()) > order) {
                 break;
             }
+            if (label != null && spaceAfterActualText.contains(label)) {
+                separate(label, text, e.getValue());
+            }
             label = e.getKey();
             text = e.getValue();
             addActualText(label, text);
             it.remove();
         }
         // after a separator the stripper wrote, the next word needs one of its own
-        if (!text.isEmpty() && !next.isEmpty()
-                && (previous == null || previous.kind != EventKind.WORD)
-                && !Character.isWhitespace(text.charAt(text.length() - 1))
-                && !Character.isWhitespace(next.charAt(0))) {
+        if (label != null && (previous == null || previous.kind != EventKind.WORD
+                || spaceAfterActualText.contains(label))) {
+            separate(label, text, next);
+        }
+    }
+
+    /** Adds a word separator between {@code before} and {@code after} unless one has it. */
+    private void separate(Label label, String before, String after) {
+        if (!before.isEmpty() && !after.isEmpty()
+                && !Character.isWhitespace(before.charAt(before.length() - 1))
+                && !Character.isWhitespace(after.charAt(0))) {
             addActualText(label, getWordSeparator());
         }
     }
