@@ -69,7 +69,8 @@ public class PDFMarkedContent2XHTMLTest extends TikaTest {
         assertContains("<div class=\"textbox\"><p>Here is a text box", xml);
         assertContains("<div class=\"footnote\"><p>1\n This is a footnote.", xml);
         assertContains("<p>Bold italic underline superscript subscript", xml);
-        assertContains("<ul>\t<li>Bullet 1", xml);
+        // each bullet is an image; its Span's /ActualText is the Symbol font's bullet
+        assertContains("<ul>\t<li>\uF0B7 Bullet 1", xml);
         assertContains("<table><tr>\t<td><p>Row 1 Col 1</p>", xml);
         assertContains("</td>\t<td><p>Row 1 Col 2</p>", xml);
         assertContains("<p>Here is a citation:", xml);
