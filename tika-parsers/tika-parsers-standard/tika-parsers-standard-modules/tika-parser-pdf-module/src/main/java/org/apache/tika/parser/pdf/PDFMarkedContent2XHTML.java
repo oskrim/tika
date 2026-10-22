@@ -24,8 +24,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -114,7 +115,9 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
     }
 
     private enum EventKind {
-        PARA_START, PARA_END, WORD, WORD_SEP, LINE_SEP
+        PARA_START, PARA_END, WORD, WORD_SEP, LINE_SEP,
+        /** An element's /ActualText in place of content that drew no text; a flat page omits it. */
+        ACTUAL_TEXT
     }
 
     /** What a glyph was drawn under: a tagged MCID in a content stream, nothing, or an artifact. */
@@ -322,8 +325,18 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
     private final Deque<COSBase> scopeStack = new ArrayDeque<>();
     private final Set<COSBase> pageScopes = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Map<TextPosition, Label> labels = new IdentityHashMap<>();
-    /** Every (scope, MCID) the page's content streams opened, with or without text. */
-    private final Set<Label> openedMcids = new HashSet<>();
+    /** Each glyph's position in content order. */
+    private final Map<TextPosition, Integer> glyphOrder = new IdentityHashMap<>();
+    /**
+     * Every (scope, MCID) the page's content streams opened, with or without text, in content
+     * order, with the number of glyphs drawn before it first opened.
+     */
+    private final Map<Label, Integer> openedMcids = new LinkedHashMap<>();
+    /** Element /ActualText still to be written while routing, by the MCID it starts at. */
+    private final Map<Label, String> pendingActualText = new LinkedHashMap<>();
+    /** Elements whose /ActualText was taken, so it is written once per document. */
+    private final Set<StructureIndex.Node> actualTextTaken =
+            Collections.newSetFromMap(new IdentityHashMap<>());
     private final List<Event> events = new ArrayList<>();
     /** The page's runs in content order, while a tagged page is written. */
     private List<Run> pageRuns = Collections.emptyList();
@@ -435,7 +448,7 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
                     (getCurrentPage() == null ? null : getCurrentPage().getCOSObject()) :
                     scopeStack.peek();
             if (scope != null) {
-                openedMcids.add(new Label(scope, mcid));
+                openedMcids.putIfAbsent(new Label(scope, mcid), glyphOrder.size());
             }
         }
         super.beginMarkedContentSequence(tag, properties);
@@ -492,6 +505,7 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
     protected void processTextPosition(TextPosition text) {
         if (index != null) {
             labels.put(text, label());
+            glyphOrder.put(text, glyphOrder.size());
         }
         super.processTextPosition(text);
     }
@@ -534,7 +548,9 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
         pageScopes.clear();
         pageScopes.add(page.getCOSObject());
         labels.clear();
+        glyphOrder.clear();
         openedMcids.clear();
+        pendingActualText.clear();
         events.clear();
         currentLabel = null;
         pendingPageStart = false;
@@ -559,12 +575,16 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
             }
             return;
         }
+        collectActualText();
         state = State.ROUTING;
         try {
             super.writePage();
+            routeActualText(Integer.MAX_VALUE, "");
         } finally {
             state = State.IDLE;
             labels.clear();
+            glyphOrder.clear();
+            pendingActualText.clear();
         }
         PageStats stats = stats();
         String rejection = gate(stats);
@@ -637,6 +657,10 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
             return;
         }
         int n = textPositions == null ? 0 : textPositions.size();
+        Integer order = n == 0 ? null : glyphOrder.get(textPositions.get(0));
+        if (order != null) {
+            routeActualText(order, text);
+        }
         Label first = n == 0 ? Label.UNTAGGED :
                 labels.getOrDefault(textPositions.get(0), Label.UNTAGGED);
         boolean straddled = false;
@@ -675,6 +699,76 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
         Event event = new Event(EventKind.WORD, text, segments);
         countShredding(event, textPositions);
         events.add(event);
+    }
+
+    /**
+     * Finds the elements whose content on this page drew no text, as when a producer draws
+     * text as images, and whose /ActualText therefore is their text: the outermost such element
+     * above each MCID, taken at its first MCID with that of the content-less siblings after it.
+     * Where the content drew text, that text is written instead; some producers put
+     * /ActualText on every Span, where it repeats the text.
+     */
+    private void collectActualText() {
+        Set<StructureIndex.Node> drewText = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Map.Entry<TextPosition, Label> e : labels.entrySet()) {
+            String u = e.getKey().getUnicode();
+            Label l = e.getValue();
+            StructureIndex.Leaf leaf = u == null || u.isBlank() || !l.tagged() ? null :
+                    index.leaf(l.scope, l.mcid);
+            StructureIndex.Node n = leaf == null ? null : leaf.node;
+            while (n != null && drewText.add(n)) {
+                n = n.parent;
+            }
+        }
+        for (Label label : openedMcids.keySet()) {
+            StructureIndex.Leaf leaf = index.leaf(label.scope, label.mcid);
+            StructureIndex.Node element = null;
+            String text = null;
+            for (StructureIndex.Node n = leaf == null ? null : leaf.node;
+                    n != null && !drewText.contains(n); n = n.parent) {
+                String actualText = n.dict.getString(COSName.ACTUAL_TEXT);
+                if (actualText != null) {
+                    element = n;
+                    text = actualText;
+                }
+            }
+            if (element != null && actualTextTaken.add(element)) {
+                pendingActualText.put(label, text + index.actualTextAfter(element));
+            }
+        }
+    }
+
+    /**
+     * Records the pending /ActualText whose MCID opened before glyph {@code order} was drawn,
+     * the first glyph of the word {@code next}.
+     */
+    private void routeActualText(int order, String next) {
+        Event previous = events.isEmpty() ? null : events.get(events.size() - 1);
+        Label label = null;
+        String text = "";
+        Iterator<Map.Entry<Label, String>> it = pendingActualText.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<Label, String> e = it.next();
+            if (openedMcids.get(e.getKey()) > order) {
+                break;
+            }
+            label = e.getKey();
+            text = e.getValue();
+            addActualText(label, text);
+            it.remove();
+        }
+        // after a separator the stripper wrote, the next word needs one of its own
+        if (!text.isEmpty() && !next.isEmpty()
+                && (previous == null || previous.kind != EventKind.WORD)
+                && !Character.isWhitespace(text.charAt(text.length() - 1))
+                && !Character.isWhitespace(next.charAt(0))) {
+            addActualText(label, getWordSeparator());
+        }
+    }
+
+    private void addActualText(Label label, String text) {
+        events.add(new Event(EventKind.ACTUAL_TEXT, text,
+                List.of(new Segment(label, text, text.isBlank() ? 0 : text.length()))));
     }
 
     /**
@@ -792,7 +886,7 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
     private PageStats stats() {
         PageStats stats = new PageStats();
         for (Event event : events) {
-            if (event.kind != EventKind.WORD) {
+            if (event.kind != EventKind.WORD && event.kind != EventKind.ACTUAL_TEXT) {
                 continue;
             }
             stats.words += event.words;
@@ -815,7 +909,7 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
         for (COSBase scope : pageScopes) {
             for (Map.Entry<Integer, StructureIndex.Leaf> e : index.leaves(scope).entrySet()) {
                 stats.leaves++;
-                if (!openedMcids.contains(new Label(scope, e.getKey()))) {
+                if (!openedMcids.containsKey(new Label(scope, e.getKey()))) {
                     stats.dangling++;
                 }
             }
@@ -1390,6 +1484,7 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
         for (Event event : events) {
             switch (event.kind) {
                 case WORD:
+                case ACTUAL_TEXT:
                     for (Segment segment : event.segments) {
                         if (current == null || !current.label.equals(segment.label)) {
                             current = new Run(segment.label, runs.size());
@@ -1614,8 +1709,8 @@ public class PDFMarkedContent2XHTML extends PDF2XHTML {
         addAttribute(attrs, "lang", element.getLanguage());
         String title = element.getTitle();
         addAttribute(attrs, "title", title == null ? element.getExpandedForm() : title);
-        // element-level /ActualText is not written: some producers put it on every Span, where
-        // it repeats the text; the marked-content form is applied by the stripper already
+        // element-level /ActualText is the element's text only where its content drew none (see
+        // collectActualText); the marked-content form is applied by the stripper already
         switch (type) {
             case "Document":
             case "NonStruct":
